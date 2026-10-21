@@ -1,0 +1,10 @@
+.deps/
+.tmp/
+.browser-profile/
+data/
+out/
+secrets/
+_recon/
+__pycache__/
+*.pyc
+*.log
