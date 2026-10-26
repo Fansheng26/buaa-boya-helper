@@ -41,6 +41,7 @@ AMBER = "#ffb020"
 FONT = "Microsoft YaHei UI"
 INTERVAL = 3600 * 1000               # 每小时刷新一次
 ALERT_COOLDOWN = 1800                # 两次弹窗至少间隔 30 分钟
+DEFAULT_LAYER_POLL = 200             # 层级检测间隔（毫秒），越小切换越跟手
 
 
 def load_settings():
@@ -51,6 +52,7 @@ def load_settings():
     s.setdefault("notify", True)
     s.setdefault("sound", True)
     s.setdefault("last_alert", 0)
+    s.setdefault("layer_poll_ms", DEFAULT_LAYER_POLL)
     return s
 
 
@@ -128,6 +130,11 @@ class Widget:
         self.root = root
         self._drag = (0, 0)
         self.settings = load_settings()
+        try:
+            self.layer_poll = max(80, min(5000, int(self.settings["layer_poll_ms"])))
+        except Exception:
+            self.layer_poll = DEFAULT_LAYER_POLL
+        save_settings(self.settings)      # 把默认值写回文件，方便手动改
         self.refreshing = False
         self.proc = None
         self.refresh_start = 0
@@ -151,9 +158,17 @@ class Widget:
         root.geometry(f"{W}x400+{self.pos[0]}+{self.pos[1]}")
         root.update_idletasks()
 
-        # 压到 z-order 最底层：只贴在桌面上，永远不挡其它应用
+        # 平时压在最底层；桌面成为前台（Win+D）时临时置顶
         self.hwnd = int(root.wm_frame(), 16)
         self._raised = True
+        self._on_top = False
+        try:
+            import ctypes
+            from ctypes import wintypes
+            ctypes.windll.user32.FindWindowW.restype = wintypes.HWND
+            self._desktop_hwnd = int(ctypes.windll.user32.FindWindowW("Progman", None) or 0)
+        except Exception:
+            self._desktop_hwnd = 0
         root.bind_all("<Button-1>", lambda e: setattr(self, "_raised", True), add="+")
         self.lower_to_bottom()
         try:
@@ -197,19 +212,75 @@ class Widget:
 
     # ---------- window ----------
     def lower_to_bottom(self):
-        """被点过（层级被抬起）才重新压回最底层，平时不做无谓的层级调整。"""
-        if self._raised:
-            self._raised = False
+        """按前台窗口决定层级。
+
+        关键点：Win+D 并不会隐藏或最小化窗口（IsWindowVisible 仍是 True），
+        它只是把桌面合成到最上层。实测「置顶窗口」能压在显示桌面之上，
+        所以这里的策略是：前台是桌面 → 置顶；前台是别的应用 → 压回最底层。
+        """
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            u = ctypes.windll.user32
+            u.GetForegroundWindow.restype = wintypes.HWND
+            u.GetAncestor.restype = wintypes.HWND
+            u.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+
+            HWND_TOP, HWND_BOTTOM, HWND_TOPMOST, HWND_NOTOPMOST = 0, 1, -1, -2
+            SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x0001, 0x0002, 0x0010
+            flags = SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE
+
+            # 被系统藏起来/最小化了就拉回来（保险，不是 Win+D 的主路径）
+            if not u.IsWindowVisible(self.hwnd) or u.IsIconic(self.hwnd):
+                u.ShowWindow(self.hwnd, 4)
+
+            fg = u.GetForegroundWindow()
+            cls = ""
+            if fg:
+                buf = ctypes.create_unicode_buffer(64)
+                u.GetClassNameW(fg, buf, 64)
+                cls = buf.value
+            is_ours = int(u.GetAncestor(fg, 2) or 0) == self.hwnd if fg else False
+            desktop_fg = cls in ("Progman", "WorkerW")
+
+            # 再探一个角落：显示桌面时那个点会露出桌面而不是某个应用窗口
+            probe_root = 0
             try:
-                import ctypes
-                HWND_BOTTOM = 1
-                SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x0001, 0x0002, 0x0010
-                ctypes.windll.user32.SetWindowPos(
-                    ctypes.c_void_p(self.hwnd), ctypes.c_void_p(HWND_BOTTOM),
-                    0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
+                class _Pt(ctypes.Structure):
+                    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+                u.WindowFromPoint.restype = wintypes.HWND
+                h = u.WindowFromPoint(_Pt(20, 20))
+                probe_root = int(u.GetAncestor(h, 2) or 0)
             except Exception:
-                pass
-        self.root.after(1500, self.lower_to_bottom)
+                probe_root = 0
+
+            if self._desktop_hwnd:
+                corner_is_desktop = (probe_root == self._desktop_hwnd)
+            else:
+                corner_is_desktop = desktop_fg
+            if probe_root == self.hwnd:
+                corner_is_desktop = desktop_fg    # 小组件正好被拖到角落，退回只看前台
+            showing_desktop = desktop_fg and corner_is_desktop
+
+            if showing_desktop and not self._on_top:
+                u.SetWindowPos(wintypes.HWND(self.hwnd), wintypes.HWND(HWND_TOPMOST),
+                               0, 0, 0, 0, flags)
+                self._on_top = True
+            elif self._on_top and not showing_desktop:
+                u.SetWindowPos(wintypes.HWND(self.hwnd), wintypes.HWND(HWND_NOTOPMOST),
+                               0, 0, 0, 0, flags)
+                u.SetWindowPos(wintypes.HWND(self.hwnd), wintypes.HWND(HWND_BOTTOM),
+                               0, 0, 0, 0, flags)
+                self._on_top = False
+            elif self._raised and not desktop_fg and not self._on_top:
+                self._raised = False
+                u.SetWindowPos(wintypes.HWND(self.hwnd), wintypes.HWND(HWND_BOTTOM),
+                               0, 0, 0, 0, flags)
+        except Exception:
+            pass
+
+        self.root.after(self.layer_poll, self.lower_to_bottom)
 
     def start_drag(self, e):
         self._drag = (e.x_root - self.root.winfo_x(), e.y_root - self.root.winfo_y())

@@ -47,7 +47,7 @@
 ### 安装
 
 ```bat
-git clone https://github.com/<你的用户名>/buaa-boya-helper.git
+git clone https://github.com/Fansheng26/buaa-boya-helper.git
 cd buaa-boya-helper
 python -m pip install -r requirements.txt
 ```
@@ -70,11 +70,34 @@ python tools\vendor_playwright.py
 | 文件 | 作用 |
 |---|---|
 | `桌面小组件.bat` | 启动桌面小窗（推荐设成开机自启） |
+| `重启小组件.bat` | 结束正在运行的实例并用新代码重新启动（改了配置或代码后用） |
 | `一键刷新.bat` | 手动刷新一次，并打开完整面板 |
 | `安装开机自启.bat` | 在启动目录创建快捷方式，开机自动运行小组件 |
 | `取消开机自启.bat` | 移除开机自启 |
 
 **课表数据只需要抓一次**（`data/byxt_grid_term.json`）。之后加退课了，重跑一次 `5-全量采集.bat`。
+
+### 配置
+
+设置存在 `data/settings.json`，可以直接编辑，**改完双击 `重启小组件.bat` 生效**：
+
+```json
+{
+  "notify": true,
+  "sound": true,
+  "layer_poll_ms": 200,
+  "last_alert": 0
+}
+```
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `notify` | `true` | 有新名额时是否弹提醒框（也可以在组件上点「提醒」切换） |
+| `sound` | `true` | 提醒时是否响提示音（同上，点「声音」切换） |
+| `layer_poll_ms` | `200` | **层级检测间隔（毫秒）**。越小，「从桌面切回应用」时小组件沉底越快；调大会更省 CPU。范围 80–5000 |
+| `last_alert` | — | 上次提醒的时间戳，程序自动维护，不用管 |
+
+> 觉得切回应用时还有滞留？把 `layer_poll_ms` 改小（比如 `100`）即可。
 
 ## 工作原理
 
@@ -136,8 +159,13 @@ angular.element(document.querySelector('table')).scope().vm.pageInfo
 ### 4. 展示
 
 - **HTML 面板**：生成时把数据直接内嵌进 `<script>`，双击就能开，不依赖服务器
-- **桌面小组件**：Tkinter 画的，无边框 + `toolwindow`，被点击抬起后 1.5 秒自动压回
+- **桌面小组件**：Tkinter 画的，无边框 + `toolwindow`，被点击抬起后 1.2 秒自动压回
   z-order 最底层（`SetWindowPos(HWND_BOTTOM)`），所以永远不会挡住别的应用
+- **「显示桌面」后仍可见**：实测发现 `Win+D` **不会隐藏或最小化窗口**——
+  `IsWindowVisible` 仍是 True、`IsIconic` 也是 False，它只是把桌面合成到了最上层，
+  所以常规的"检测被隐藏再拉回来"根本触发不了。真正有用的事实是：**置顶窗口能压在显示桌面之上**。
+  于是改成每 0.8 秒判断一次「桌面是否在前台 + 屏幕角落露出的也是桌面」：
+  是就临时置顶，回到任何应用就取消置顶并压回最底层
 - **提醒**：独立进程弹一个 `-topmost` 的小窗，不受小组件层级影响
 
 ## 目录结构
@@ -194,7 +222,8 @@ secrets/cred.bin          DPAPI 加密的凭据（不入库）
 A：先关掉所有由本工具打开的 Edge 窗口（后台刷新最多占 7 分钟）。
 
 **Q：小组件不见了？**
-A：它被压在最底层，按 `Win+D` 或最小化其它窗口就能看到。重复双击不会开第二个窗口（单实例锁）。
+A：它是被「压在最底层」而不是被隐藏，按 `Win+D` 后约 1 秒会自动回来；
+如果只是被别的窗口盖住，最小化那个窗口就能看到。重复双击不会开第二个窗口（单实例锁）。
 
 **Q：想换账号？**
 A：删掉 `secrets/cred.bin` 和 `.browser-profile/`，重跑 `1-首次登录.bat`。
